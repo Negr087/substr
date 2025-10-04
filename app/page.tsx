@@ -198,24 +198,27 @@ const handleVideoPause = () => {
 
   // Decodificar note ID (NIP-19)
   const decodeNoteId = (id: string) => {
-  try {
-    if (id.startsWith('note1')) {
-      const decoded = nip19.decode(id);
-      return { type: 'note', hex: decoded.data as string };
+    try {
+      // Limpiar prefijo "nostr:" si existe
+      const cleanId = id.trim().replace(/^nostr:/, '');
+      
+      if (cleanId.startsWith('note1')) {
+        const decoded = nip19.decode(cleanId);
+        return { type: 'note', hex: decoded.data as string };
+      }
+      if (cleanId.startsWith('nevent1')) {
+        const decoded = nip19.decode(cleanId);
+        return { type: 'nevent', hex: (decoded.data as { id: string }).id };
+      }
+      if (/^[0-9a-f]{64}$/i.test(cleanId)) {
+        return { type: 'hex', hex: cleanId };
+      }
+      return null;
+    } catch (error: unknown) {
+      console.error('Error decodificando ID:', error);
+      return null;
     }
-    if (id.startsWith('nevent1')) {
-      const decoded = nip19.decode(id);
-      return { type: 'nevent', hex: (decoded.data as { id: string }).id };
-    }
-    if (/^[0-9a-f]{64}$/i.test(id)) {
-      return { type: 'hex', hex: id };
-    }
-    return null;
-  } catch (error: unknown) {
-  console.error('Error decodificando ID:', error);
-  return null;
-}
-};
+  };
 
   // Conectar a relays y obtener evento
   const fetchNostrEvent = async (eventId: string): Promise<NostrEvent> => {
