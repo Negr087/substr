@@ -147,8 +147,10 @@ const transcribeAudio = async (audioBlob: Blob) => {
         return updated;
       });
     }
-  } catch (error) {
-  }
+  } catch (error: unknown) {
+  console.error('💥 Error transcribiendo:', error);
+  setError('Error al transcribir el audio. Verifica tu API key.');
+}
 };
 
 const stopTranscription = () => {
@@ -209,10 +211,10 @@ const handleVideoPause = () => {
       return { type: 'hex', hex: id };
     }
     return null;
-  } catch (error) {
-    console.error('Error decodificando ID:', error);
-    return null;
-  }
+  } catch (error: unknown) {
+  console.error('Error decodificando ID:', error);
+  return null;
+}
 };
 
   // Conectar a relays y obtener evento
