@@ -102,8 +102,8 @@ const mediaRecorder = new MediaRecorder(destination.stream, options);
     }
 
     setIsTranscribing(true);
-  } catch (error) {
-    console.error('Error iniciando transcripción:', error);
+  } catch (err) {  // 👈 Cambiar a 'err'
+  console.error('Error iniciando transcripción:', err);
     setError('Error al capturar audio del video');
   }
 };
