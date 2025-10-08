@@ -29,6 +29,7 @@ const mediaRecorderRef = useRef<MediaRecorder | null>(null);
 const audioChunksRef = useRef<Blob[]>([]);
 const audioContextRef = useRef<AudioContext | null>(null);
 const sourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
+const mimeTypeRef = useRef<string>('audio/webm');
 const videoRef = useRef<HTMLVideoElement>(null);
 
 const handleResetApp = () => {
@@ -61,7 +62,23 @@ const startTranscription = async () => {
 
       // Configurar MediaRecorder
       // Intentar grabar en formato compatible con Hugging Face
-const options = { mimeType: 'audio/webm;codecs=opus' };
+// Intentar grabar en WAV, si no funciona usar WebM
+let options: MediaRecorderOptions = {};
+const mimeTypes = [
+  'audio/wav',
+  'audio/ogg;codecs=opus',
+  'audio/webm;codecs=opus',
+  'audio/webm'
+];
+
+for (const mime of mimeTypes) {
+  if (MediaRecorder.isTypeSupported(mime)) {
+    options = { mimeType: mime, audioBitsPerSecond: 128000 };
+    console.log('✅ Usando formato:', mime);
+    break;
+  }
+}
+
 const mediaRecorder = new MediaRecorder(destination.stream, options);
       mediaRecorderRef.current = mediaRecorder;
       audioChunksRef.current = [];
@@ -73,14 +90,16 @@ const mediaRecorder = new MediaRecorder(destination.stream, options);
       };
 
       mediaRecorder.onstop = async () => {
-  const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+  const mimeType = mediaRecorderRef.current?.mimeType || 'audio/webm';
+mimeTypeRef.current = mimeType; // 👈 GUARDAR EN EL REF
+const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
+console.log('📦 Blob creado con tipo:', mimeType, 'tamaño:', audioBlob.size);
   
   // Solo transcribir si el audio es mayor a 50KB
-  if (audioBlob.size > 50000) {
-    await transcribeAudio(audioBlob);
-  } else {
-    console.log('⚠️ Audio muy pequeño, omitiendo transcripción');
-  }
+  if (audioBlob.size > 30000) {
+  const mimeType = mimeTypeRef.current;
+  await transcribeAudio(audioBlob, mimeType);
+}
   
   audioChunksRef.current = [];
 };
@@ -98,7 +117,7 @@ const mediaRecorder = new MediaRecorder(destination.stream, options);
             startTranscription(); // Continuar grabando
           }
         }
-      }, 4000);
+      }, 15000);
     }
 
     setIsTranscribing(true);
@@ -108,12 +127,13 @@ const mediaRecorder = new MediaRecorder(destination.stream, options);
   }
 };
 
-const transcribeAudio = async (audioBlob: Blob) => {
+const transcribeAudio = async (audioBlob: Blob, mimeType: string) => {
   try {
     console.log('📤 Enviando audio a transcribir...', audioBlob.size, 'bytes');
     
     const formData = new FormData();
-    formData.append('audio', audioBlob, 'audio.webm');
+    const extension = mimeType.split('/')[1].split(';')[0];
+formData.append('audio', audioBlob, `audio.${extension}`);
 
     const response = await fetch('/api/transcribe', {
       method: 'POST',

@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { BatchClient } from '@speechmatics/batch-client';
 
 export async function OPTIONS() {
   return new NextResponse(null, {
@@ -8,34 +9,6 @@ export async function OPTIONS() {
       'Access-Control-Allow-Headers': 'Content-Type',
     },
   });
-}
-
-// Función para traducir texto a español
-async function translateToSpanish(text: string): Promise<string> {
-  try {
-    const response = await fetch(
-      'https://api-inference.huggingface.co/models/Helsinki-NLP/opus-mt-en-es',
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${process.env.HUGGINGFACE_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ inputs: text }),
-      }
-    );
-
-    if (!response.ok) {
-      console.error('❌ Error en traducción');
-      return text; // Devolver texto original si falla
-    }
-
-    const result = await response.json();
-    return result[0]?.translation_text || text;
-  } catch (error) {
-    console.error('❌ Error traduciendo:', error);
-    return text; // Devolver texto original si falla
-  }
 }
 
 export async function POST(request: NextRequest) {
@@ -51,55 +24,83 @@ export async function POST(request: NextRequest) {
     }
 
     console.log('🎙️ Transcribiendo audio...', audioFile.size, 'bytes');
-    const audioBuffer = await audioFile.arrayBuffer();
 
-    // Paso 1: Transcribir audio con Whisper
-    const transcriptionResponse = await fetch(
-      'https://api-inference.huggingface.co/models/openai/whisper-large-v3',
+    // Crear cliente de Speechmatics
+    const client = new BatchClient({
+      apiKey: process.env.SPEECHMATICS_API_KEY!,
+      appId: 'substr-nostr-client',
+    });
+
+    console.log('📤 Enviando a Speechmatics...');
+
+    // Transcribir con traducción
+    const response = await client.transcribe(
+      audioFile,
       {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${process.env.HUGGINGFACE_API_KEY}`,
-          'Content-Type': 'audio/webm',
+        transcription_config: {
+          language: 'en',
+          operating_point: 'enhanced',
         },
-        body: audioBuffer,
-      }
+        translation_config: {
+          target_languages: ['es'],
+        },
+      },
+      'json-v2'
     );
 
-    if (!transcriptionResponse.ok) {
-      const errorText = await transcriptionResponse.text();
-      console.error('❌ Error de Hugging Face:', errorText);
-      throw new Error(`API error: ${transcriptionResponse.status} - ${errorText}`);
-    }
-
-    const transcriptionResult = await transcriptionResponse.json();
     console.log('✅ Transcripción completada');
 
-    // Paso 2: Traducir cada segmento a español
-    const segments = transcriptionResult.chunks || [{ timestamp: [0], text: transcriptionResult.text }];
+    // Extraer traducción al español
+    let translatedText = '';
+    let segments: any[] = [];
+
+    // Verificar si la respuesta tiene traducciones
+    const jsonResponse = response as any;
     
-    const translatedSegments = await Promise.all(
-      segments.map(async (chunk: any) => {
-        const translatedText = await translateToSpanish(chunk.text);
-        console.log(`🌐 "${chunk.text}" → "${translatedText}"`);
-        return {
-          start: chunk.timestamp[0],
-          text: translatedText
-        };
-      })
-    );
+    if (jsonResponse.translations?.es) {
+      const esTranslation = jsonResponse.translations.es as any;
+      
+      // Extraer palabras traducidas
+      const words = esTranslation.results?.filter((r: any) => r.type === 'word') || [];
+      
+      segments = words.map((r: any) => ({
+        start: r.start_time,
+        text: r.alternatives?.[0]?.content || '',
+      }));
 
-    const responseData = {
-      text: translatedSegments.map(s => s.text).join(' '),
-      segments: translatedSegments
-    };
+      translatedText = words
+        .map((w: any) => w.alternatives?.[0]?.content || '')
+        .join(' ');
+    }
 
-    return NextResponse.json(responseData);
+    // Fallback: usar transcripción original en inglés si no hay traducción
+    if (!translatedText && jsonResponse.results) {
+      const words = jsonResponse.results?.filter((r: any) => r.type === 'word') || [];
+      
+      segments = words.map((r: any) => ({
+        start: r.start_time,
+        text: r.alternatives?.[0]?.content || '',
+      }));
+
+      translatedText = words
+        .map((w: any) => w.alternatives?.[0]?.content || '')
+        .join(' ');
+    }
+
+    console.log('📝 Texto traducido:', translatedText.substring(0, 80) + '...');
+
+    return NextResponse.json({
+      text: translatedText,
+      segments: segments,
+    });
 
   } catch (error: any) {
     console.error('❌ Error completo:', error);
     return NextResponse.json(
-      { error: 'Error al procesar el audio', details: error.message },
+      { 
+        error: 'Error al procesar el audio', 
+        details: error.message || String(error) 
+      },
       { status: 500 }
     );
   }
