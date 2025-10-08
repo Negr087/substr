@@ -73,7 +73,7 @@ const mimeTypes = [
 
 for (const mime of mimeTypes) {
   if (MediaRecorder.isTypeSupported(mime)) {
-    options = { mimeType: mime, audioBitsPerSecond: 128000 };
+    options = { mimeType: mime, audioBitsPerSecond: 64000 };
     console.log('✅ Usando formato:', mime);
     break;
   }
@@ -96,7 +96,7 @@ const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
 console.log('📦 Blob creado con tipo:', mimeType, 'tamaño:', audioBlob.size);
   
   // Solo transcribir si el audio es mayor a 50KB
-  if (audioBlob.size > 30000) {
+  if (audioBlob.size > 5000) {
   const mimeType = mimeTypeRef.current;
   await transcribeAudio(audioBlob, mimeType);
 }
@@ -111,13 +111,13 @@ console.log('📦 Blob creado con tipo:', mimeType, 'tamaño:', audioBlob.size);
       mediaRecorderRef.current.start();
       
       setTimeout(() => {
-        if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-          mediaRecorderRef.current.stop();
-          if (videoRef.current && !videoRef.current.paused) {
-            startTranscription(); // Continuar grabando
-          }
-        }
-      }, 15000);
+  if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+    mediaRecorderRef.current.stop();
+    if (videoRef.current && !videoRef.current.paused) {
+      startTranscription(); // Continuar grabando
+    }
+  }
+}, 2000); 
     }
 
     setIsTranscribing(true);
@@ -148,6 +148,9 @@ formData.append('audio', audioBlob, `audio.${extension}`);
 
     const data = await response.json();
     console.log('✅ Transcripción recibida:', data);
+    console.log('📊 Cantidad de segmentos:', data.segments?.length);
+console.log('📝 Texto completo:', data.text);
+console.log('🎯 Primer segmento:', data.segments?.[0]);
     
     // Procesar segmentos con timestamps
     if (data.segments) {
@@ -158,14 +161,16 @@ formData.append('audio', audioBlob, `audio.${extension}`);
       })).filter((sub: {time: number, text: string}) => sub.text);
 
       setSubtitles(prev => {
-        const updated = [...prev, ...newSubtitles];
-        // Guardar en cache
-        setTranscriptionCache(cache => ({
-          ...cache,
-          [videoUrl]: updated
-        }));
-        return updated;
-      });
+  const updated = [...prev, ...newSubtitles];
+  console.log('💾 Total subtítulos guardados:', updated.length); // 👈 AGREGAR
+  console.log('🎬 Último subtítulo agregado:', newSubtitles[newSubtitles.length - 1]); // 👈 AGREGAR
+  // Guardar en cache
+  setTranscriptionCache(cache => ({
+    ...cache,
+    [videoUrl]: updated
+  }));
+  return updated;
+});
     }
   } catch (error: unknown) {
   console.error('💥 Error transcribiendo:', error);
@@ -368,19 +373,22 @@ useEffect(() => {
 
   const video = videoRef.current;
   const updateSubtitle = () => {
-    const currentTime = video.currentTime;
-    
-    // Encontrar subtítulo activo (funciona hacia adelante Y atrás)
-    const activeSubtitle = subtitles
-      .filter(sub => sub.time <= currentTime && sub.time + 3 > currentTime) // 👈 Ventana de 3 seg
-      .sort((a, b) => b.time - a.time)[0];
-    
-    if (activeSubtitle) {
-      setCurrentSubtitle(activeSubtitle.text);
-    } else {
-      setCurrentSubtitle('');
-    }
-  };
+  const currentTime = video.currentTime;
+  
+  console.log('⏱️ Tiempo actual:', currentTime, 'Total subs:', subtitles.length); // 👈 AGREGAR
+  
+  // Encontrar subtítulo activo
+  const activeSubtitle = subtitles
+    .filter(sub => sub.time <= currentTime && sub.time + 3 > currentTime)
+    .sort((a, b) => b.time - a.time)[0];
+  
+  if (activeSubtitle) {
+    console.log('✅ Mostrando sub:', activeSubtitle.text); // 👈 AGREGAR
+    setCurrentSubtitle(activeSubtitle.text);
+  } else {
+    setCurrentSubtitle('');
+  }
+};
 
   video.addEventListener('timeupdate', updateSubtitle);
   video.addEventListener('seeked', updateSubtitle); // 👈 AGREGAR ESTO para cuando retrocedes
