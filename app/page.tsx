@@ -1,7 +1,7 @@
 'use client';
 
 import { nip19 } from 'nostr-tools';
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Search, Play, Subtitles, AlertCircle, Loader2 } from 'lucide-react';
 
 interface NostrEvent {
@@ -10,242 +10,239 @@ interface NostrEvent {
   tags: string[][];
 }
 
-interface Segment {
-  start: number;
-  text: string;
-}
+const SAMPLE_RATE = 16000;
+
+const RELAYS = [
+  'wss://relay.damus.io',
+  'wss://relay.nostr.band',
+  'wss://nos.lol',
+  'wss://relay.snort.social',
+];
 
 const SubstrClient = () => {
   const [noteId, setNoteId] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [videoUrl, setVideoUrl] = useState('');
-  const [subtitles, setSubtitles] = useState<{time: number, text: string}[]>([]);
+  const [subtitles, setSubtitles] = useState<{ time: number; text: string }[]>([]);
   const [currentSubtitle, setCurrentSubtitle] = useState('');
-  const [transcriptionCache, setTranscriptionCache] = useState<{[key: string]: {time: number, text: string}[]}>({});
-  // Agrega este nuevo estado:
-const [isTranscribing, setIsTranscribing] = useState(false);
-const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-const audioChunksRef = useRef<Blob[]>([]);
-const audioContextRef = useRef<AudioContext | null>(null);
-const sourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
-const mimeTypeRef = useRef<string>('audio/webm');
-const videoRef = useRef<HTMLVideoElement>(null);
+  const [isTranscribing, setIsTranscribing] = useState(false);
 
-const handleResetApp = () => {
-  setNoteId('');
-  setVideoUrl('');
-  setSubtitles([]);
-  setCurrentSubtitle('');
-  setError('');
-  stopTranscription();
-};
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const sourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
+  const realtimeClientRef = useRef<unknown>(null);
+  const workletModuleAddedRef = useRef(false);
+  const streamStartVideoTimeRef = useRef(0);
 
-// Nueva función para capturar y transcribir audio
-const startTranscription = async () => {
-  try {
+  const stopTranscription = useCallback(() => {
+    if (workletNodeRef.current) {
+      workletNodeRef.current.port.onmessage = null;
+      workletNodeRef.current.disconnect();
+      workletNodeRef.current = null;
+    }
+    if (realtimeClientRef.current) {
+      const client = realtimeClientRef.current as { stopRecognition: (opts?: { noTimeout?: true }) => Promise<void> };
+      realtimeClientRef.current = null;
+      client.stopRecognition({ noTimeout: true }).catch(() => {});
+    }
+    setIsTranscribing(false);
+  }, []);
+
+  const startTranscription = useCallback(async () => {
     const videoElement = videoRef.current;
     if (!videoElement) return;
 
-    // Reutilizar AudioContext si ya existe
-    if (!audioContextRef.current) {
-      audioContextRef.current = new AudioContext();
-    }
+    stopTranscription();
 
-    // Solo crear source si no existe
-    if (!sourceNodeRef.current) {
-      const source = audioContextRef.current.createMediaElementSource(videoElement);
-      const destination = audioContextRef.current.createMediaStreamDestination();
-      source.connect(destination);
-      source.connect(audioContextRef.current.destination);
-      sourceNodeRef.current = source;
+    try {
+      // 1. Get temporary JWT from our server
+      const jwtRes = await fetch('/api/speechmatics-jwt');
+      if (!jwtRes.ok) throw new Error('No se pudo obtener token de Speechmatics');
+      const { jwt, error: jwtError } = await jwtRes.json();
+      if (jwtError) throw new Error(jwtError);
 
-      // Configurar MediaRecorder
-      // Intentar grabar en formato compatible con Hugging Face
-// Intentar grabar en WAV, si no funciona usar WebM
-let options: MediaRecorderOptions = {};
-const mimeTypes = [
-  'audio/wav',
-  'audio/ogg;codecs=opus',
-  'audio/webm;codecs=opus',
-  'audio/webm'
-];
+      // 2. Setup AudioContext (once, reused across videos)
+      if (!audioContextRef.current) {
+        audioContextRef.current = new AudioContext({ sampleRate: SAMPLE_RATE });
+      }
+      const audioCtx = audioContextRef.current;
+      if (audioCtx.state === 'suspended') await audioCtx.resume();
 
-for (const mime of mimeTypes) {
-  if (MediaRecorder.isTypeSupported(mime)) {
-    options = { mimeType: mime, audioBitsPerSecond: 64000 };
-    console.log('✅ Usando formato:', mime);
-    break;
-  }
-}
+      // 3. Load AudioWorklet module (once)
+      if (!workletModuleAddedRef.current) {
+        await audioCtx.audioWorklet.addModule('/pcm-processor.js');
+        workletModuleAddedRef.current = true;
+      }
 
-const mediaRecorder = new MediaRecorder(destination.stream, options);
-      mediaRecorderRef.current = mediaRecorder;
-      audioChunksRef.current = [];
+      // 4. Create a new worklet node for this stream
+      const workletNode = new AudioWorkletNode(audioCtx, 'pcm-processor');
+      workletNodeRef.current = workletNode;
 
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
+      // 5. Connect audio graph — source node is tied to the video element, create once
+      if (!sourceNodeRef.current) {
+        const source = audioCtx.createMediaElementSource(videoElement);
+        source.connect(audioCtx.destination); // keep audio playing
+        source.connect(workletNode);
+        sourceNodeRef.current = source;
+      } else {
+        sourceNodeRef.current.connect(workletNode);
+      }
+
+      // 6. Create Speechmatics real-time client (dynamic import for browser safety)
+      const { RealtimeClient } = await import('@speechmatics/real-time-client');
+      const client = new RealtimeClient();
+      realtimeClientRef.current = client;
+
+      // Record video time at stream start so we can align subtitle timestamps
+      streamStartVideoTimeRef.current = videoElement.currentTime;
+
+      // 7. Listen for transcription/translation events
+      client.addEventListener('receiveMessage', (evt) => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const data = (evt as any).data as { message: string; results?: { content: string; start_time?: number }[]; reason?: string; type?: string };
+        const msg = data.message;
+
+        if (msg === 'AddPartialTranslation') {
+          // Show partial results immediately for low latency
+          const text = (data.results ?? []).map(r => r.content).join(' ').trim();
+          if (text) setCurrentSubtitle(text);
+
+        } else if (msg === 'AddTranslation') {
+          // Store final results with video timestamps
+          const results = data.results ?? [];
+          if (results.length > 0) {
+            const newSubs = results
+              .filter(r => r.content?.trim())
+              .map(r => ({
+                time: streamStartVideoTimeRef.current + (r.start_time ?? 0),
+                text: r.content.trim(),
+              }));
+            if (newSubs.length > 0) {
+              setSubtitles(prev => [...prev, ...newSubs]);
+            }
+            const text = results.map(r => r.content).join(' ').trim();
+            if (text) setCurrentSubtitle(text);
+          }
+
+        } else if (msg === 'AddPartialTranscript') {
+          // Fallback to English partial if no translation yet
+          const hasText = (data.results ?? []).some(r => r.content?.trim());
+          if (hasText) {
+            // Only show if we haven't received any translation partials
+            // (translation partials will override this)
+          }
+
+        } else if (msg === 'Error') {
+          console.error('Speechmatics error:', data);
+          setError('Error de Speechmatics: ' + (data.reason ?? data.type ?? 'desconocido'));
+          stopTranscription();
+        }
+      });
+
+      // 8. Start recognition session
+      await client.start(jwt, {
+        transcription_config: {
+          language: 'en',
+          operating_point: 'enhanced',
+          enable_partials: true,
+        },
+        translation_config: {
+          target_languages: ['es'],
+          enable_partials: true,
+        },
+        audio_format: {
+          type: 'raw',
+          encoding: 'pcm_s16le',
+          sample_rate: SAMPLE_RATE,
+        },
+      });
+
+      // 9. Stream PCM audio from worklet to Speechmatics
+      workletNode.port.onmessage = (event: MessageEvent) => {
+        const currentClient = realtimeClientRef.current as { sendAudio: (data: ArrayBuffer) => void } | null;
+        if (currentClient) {
+          currentClient.sendAudio(event.data);
         }
       };
 
-      mediaRecorder.onstop = async () => {
-  const mimeType = mediaRecorderRef.current?.mimeType || 'audio/webm';
-mimeTypeRef.current = mimeType; // 👈 GUARDAR EN EL REF
-const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
-console.log('📦 Blob creado con tipo:', mimeType, 'tamaño:', audioBlob.size);
-  
-  // Solo transcribir si el audio es mayor a 50KB
-  if (audioBlob.size > 5000) {
-  const mimeType = mimeTypeRef.current;
-  await transcribeAudio(audioBlob, mimeType);
-}
-  
-  audioChunksRef.current = [];
-};
-
+      setIsTranscribing(true);
+    } catch (err) {
+      console.error('Error iniciando transcripción:', err);
+      setError('Error al iniciar la transcripción en tiempo real');
     }
+  }, [stopTranscription]);
 
-    // Iniciar grabación
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'inactive') {
-      mediaRecorderRef.current.start();
-      
-      setTimeout(() => {
-  if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-    mediaRecorderRef.current.stop();
-    if (videoRef.current && !videoRef.current.paused) {
-      startTranscription(); // Continuar grabando
-    }
-  }
-}, 2000); 
-    }
+  // When video is seeked while paused, show the stored subtitle for that time
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
 
-    setIsTranscribing(true);
-  } catch (err) {  // 👈 Cambiar a 'err'
-  console.error('Error iniciando transcripción:', err);
-    setError('Error al capturar audio del video');
-  }
-};
+    const onSeeked = () => {
+      if (isTranscribing) return;
+      const t = video.currentTime;
+      const active = subtitles
+        .filter(s => s.time <= t && s.time + 5 > t)
+        .sort((a, b) => b.time - a.time)[0];
+      setCurrentSubtitle(active?.text ?? '');
+    };
 
-const transcribeAudio = async (audioBlob: Blob, mimeType: string) => {
-  try {
-    console.log('📤 Enviando audio a transcribir...', audioBlob.size, 'bytes');
-    
-    const formData = new FormData();
-    const extension = mimeType.split('/')[1].split(';')[0];
-formData.append('audio', audioBlob, `audio.${extension}`);
+    video.addEventListener('seeked', onSeeked);
+    return () => video.removeEventListener('seeked', onSeeked);
+  }, [subtitles, isTranscribing]);
 
-    const response = await fetch('/api/transcribe', {
-      method: 'POST',
-      body: formData,
-    });
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      stopTranscription();
+      audioContextRef.current?.close();
+    };
+  }, [stopTranscription]);
 
-    if (!response.ok) {
-      const errorData = await response.json();
-      console.error('❌ Error en respuesta:', errorData);
-      throw new Error('Error en transcripción');
-    }
+  const handleVideoPlay = () => {
+    startTranscription();
+  };
 
-    const data = await response.json();
-    console.log('✅ Transcripción recibida:', data);
-    console.log('📊 Cantidad de segmentos:', data.segments?.length);
-console.log('📝 Texto completo:', data.text);
-console.log('🎯 Primer segmento:', data.segments?.[0]);
-    
-    // Procesar segmentos con timestamps
-    if (data.segments) {
-      const currentTime = videoRef.current?.currentTime || 0;
-      const newSubtitles = data.segments.map((segment: Segment) => ({
-        time: currentTime + segment.start,
-        text: segment.text.trim()
-      })).filter((sub: {time: number, text: string}) => sub.text);
+  const handleVideoPause = () => {
+    stopTranscription();
+  };
 
-      setSubtitles(prev => {
-  const updated = [...prev, ...newSubtitles];
-  console.log('💾 Total subtítulos guardados:', updated.length); // 👈 AGREGAR
-  console.log('🎬 Último subtítulo agregado:', newSubtitles[newSubtitles.length - 1]); // 👈 AGREGAR
-  // Guardar en cache
-  setTranscriptionCache(cache => ({
-    ...cache,
-    [videoUrl]: updated
-  }));
-  return updated;
-});
-    }
-  } catch (error: unknown) {
-  console.error('💥 Error transcribiendo:', error);
-  setError('Error al transcribir el audio. Verifica tu API key.');
-}
-};
+  const handleResetApp = () => {
+    stopTranscription();
+    audioContextRef.current?.close();
+    audioContextRef.current = null;
+    sourceNodeRef.current = null;
+    workletModuleAddedRef.current = false;
+    setNoteId('');
+    setVideoUrl('');
+    setSubtitles([]);
+    setCurrentSubtitle('');
+    setError('');
+  };
 
-const stopTranscription = () => {
-  if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-    mediaRecorderRef.current.stop();
-  }
-  setIsTranscribing(false);
-};
-
-// Nuevos handlers para el video
-const handleVideoPlay = () => {
-  const currentTime = videoRef.current?.currentTime || 0;
-  
-  // Verificar si ya tenemos transcripción para este rango de tiempo
-  const hasTranscriptionForCurrentTime = subtitles.some(
-    sub => sub.time >= currentTime - 10 && sub.time <= currentTime + 10
-  );
-
-  if (transcriptionCache[videoUrl] && transcriptionCache[videoUrl].length > 0) {
-    console.log('✅ Usando transcripción en cache');
-    setSubtitles(transcriptionCache[videoUrl]);
-    
-    // Si retrocedimos a una parte sin transcribir, continuar transcribiendo
-    if (!hasTranscriptionForCurrentTime) {
-      startTranscription();
-    }
-    return;
-  }
-  
-  startTranscription();
-};
-
-const handleVideoPause = () => {
-  stopTranscription();
-  // No limpiar subtítulos, solo detener grabación
-};
-
-  // Relays de Nostr
-  const RELAYS = [
-    'wss://relay.damus.io',
-    'wss://relay.nostr.band',
-    'wss://nos.lol',
-    'wss://relay.snort.social'
-  ];
-
-  // Decodificar note ID (NIP-19)
+  // Decode Nostr note ID (NIP-19)
   const decodeNoteId = (id: string) => {
     try {
-      // Limpiar prefijo "nostr:" si existe
       const cleanId = id.trim().replace(/^nostr:/, '');
-      
       if (cleanId.startsWith('note1')) {
         const decoded = nip19.decode(cleanId);
-        return { type: 'note', hex: decoded.data as string };
+        return { hex: decoded.data as string };
       }
       if (cleanId.startsWith('nevent1')) {
         const decoded = nip19.decode(cleanId);
-        return { type: 'nevent', hex: (decoded.data as { id: string }).id };
+        return { hex: (decoded.data as { id: string }).id };
       }
       if (/^[0-9a-f]{64}$/i.test(cleanId)) {
-        return { type: 'hex', hex: cleanId };
+        return { hex: cleanId };
       }
       return null;
-    } catch (error: unknown) {
-      console.error('Error decodificando ID:', error);
+    } catch {
       return null;
     }
   };
 
-  // Conectar a relays y obtener evento
+  // Connect to Nostr relays and fetch event
   const fetchNostrEvent = async (eventId: string): Promise<NostrEvent> => {
     return new Promise((resolve, reject) => {
       let relayIndex = 0;
@@ -258,22 +255,17 @@ const handleVideoPause = () => {
         }
 
         const ws = new WebSocket(RELAYS[relayIndex]);
-        let timeoutId: NodeJS.Timeout;
+        let timeoutId: ReturnType<typeof setTimeout>;
 
         ws.onopen = () => {
-          const subscription = JSON.stringify([
-            'REQ',
-            'substr-' + Math.random(),
-            { ids: [eventId] }
-          ]);
-          ws.send(subscription);
+          ws.send(JSON.stringify(['REQ', 'substr-' + Math.random(), { ids: [eventId] }]));
           timeoutId = setTimeout(() => {
             if (!eventFound) {
               ws.close();
               relayIndex++;
               tryRelay();
             }
-          }, 5000); // 5 seconds per relay
+          }, 5000);
         };
 
         ws.onmessage = (msg) => {
@@ -284,8 +276,7 @@ const handleVideoPause = () => {
               clearTimeout(timeoutId);
               ws.close();
               resolve(data[2] as NostrEvent);
-            }
-            if (data[0] === 'EOSE' && !eventFound) {
+            } else if (data[0] === 'EOSE' && !eventFound) {
               clearTimeout(timeoutId);
               ws.close();
               relayIndex++;
@@ -298,6 +289,7 @@ const handleVideoPause = () => {
 
         ws.onerror = () => {
           clearTimeout(timeoutId);
+          ws.close();
           relayIndex++;
           tryRelay();
         };
@@ -307,53 +299,43 @@ const handleVideoPause = () => {
     });
   };
 
-  // Extraer URL de video del evento
-  const extractVideoUrl = (event: NostrEvent) => {
+  // Extract video URL from Nostr event
+  const extractVideoUrl = (event: NostrEvent): string | null => {
     if (event.kind === 1063) {
-      const urlTag = event.tags.find((tag: string[]) => tag[0] === 'url');
+      const urlTag = event.tags.find(tag => tag[0] === 'url');
       if (urlTag) return urlTag[1];
     }
-    
     if (event.kind === 1) {
       const urlRegex = /(https?:\/\/[^\s]+\.(mp4|webm|ogg|mov))/gi;
       const match = event.content.match(urlRegex);
       if (match) return match[0];
-      
       const videoRegex = /(https?:\/\/(www\.)?(youtube\.com|youtu\.be|vimeo\.com)[^\s]+)/gi;
       const videoMatch = event.content.match(videoRegex);
       if (videoMatch) return videoMatch[0];
     }
-    
     return null;
   };
 
-  // Modificar handleSearch para limpiar cache al cambiar video
-const handleSearch = async () => {
-  if (!noteId.trim()) return;
+  const handleSearch = async () => {
+    if (!noteId.trim()) return;
 
-  setLoading(true);
-  setError('');
-  setVideoUrl('');
-  setSubtitles([]);
-  setCurrentSubtitle('');
-  setTranscriptionCache({}); // 👈 Limpiar cache
+    setLoading(true);
+    setError('');
+    setVideoUrl('');
+    setSubtitles([]);
+    setCurrentSubtitle('');
+    stopTranscription();
 
     try {
       const decoded = decodeNoteId(noteId.trim());
-      if (!decoded) {
-        throw new Error('Formato de note ID inválido');
-      }
+      if (!decoded) throw new Error('Formato de note ID inválido');
 
       const event = await fetchNostrEvent(decoded.hex);
       const url = extractVideoUrl(event);
+      if (!url) throw new Error('No se encontró video en esta nota');
 
-      if (!url) {
-        throw new Error('No se encontró video en esta nota');
-      }
-
-      // Usar proxy para evitar problemas de CORS
-const proxiedUrl = `/api/proxy-video?url=${encodeURIComponent(url)}`;
-setVideoUrl(proxiedUrl);
+      const proxiedUrl = `/api/proxy-video?url=${encodeURIComponent(url)}`;
+      setVideoUrl(proxiedUrl);
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -362,42 +344,8 @@ setVideoUrl(proxiedUrl);
   };
 
   const handleKeyPress = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter') {
-      handleSearch();
-    }
+    if (e.key === 'Enter') handleSearch();
   };
-
-  // Modificar el efecto de subtítulos
-useEffect(() => {
-  if (!videoRef.current) return;
-
-  const video = videoRef.current;
-  const updateSubtitle = () => {
-  const currentTime = video.currentTime;
-  
-  console.log('⏱️ Tiempo actual:', currentTime, 'Total subs:', subtitles.length); // 👈 AGREGAR
-  
-  // Encontrar subtítulo activo
-  const activeSubtitle = subtitles
-    .filter(sub => sub.time <= currentTime && sub.time + 3 > currentTime)
-    .sort((a, b) => b.time - a.time)[0];
-  
-  if (activeSubtitle) {
-    console.log('✅ Mostrando sub:', activeSubtitle.text); // 👈 AGREGAR
-    setCurrentSubtitle(activeSubtitle.text);
-  } else {
-    setCurrentSubtitle('');
-  }
-};
-
-  video.addEventListener('timeupdate', updateSubtitle);
-  video.addEventListener('seeked', updateSubtitle); // 👈 AGREGAR ESTO para cuando retrocedes
-  
-  return () => {
-    video.removeEventListener('timeupdate', updateSubtitle);
-    video.removeEventListener('seeked', updateSubtitle); // 👈 AGREGAR ESTO
-  };
-}, [subtitles, videoUrl]);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-purple-900 via-purple-800 to-indigo-900 p-6">
@@ -406,12 +354,12 @@ useEffect(() => {
         <div className="text-center mb-8">
           <div className="flex items-center justify-center gap-3 mb-4">
             <Subtitles className="w-12 h-12 text-purple-300" />
-            <h1 
-  className="text-5xl font-bold text-white cursor-pointer hover:text-purple-200 transition-colors"
-  onClick={handleResetApp}
->
-  substr
-</h1>
+            <h1
+              className="text-5xl font-bold text-white cursor-pointer hover:text-purple-200 transition-colors"
+              onClick={handleResetApp}
+            >
+              substr
+            </h1>
           </div>
           <p className="text-purple-200 text-lg">
             Cliente Nostr con subtítulos automáticos en español
@@ -439,11 +387,7 @@ useEffect(() => {
                 disabled={loading}
                 className="px-6 py-3 bg-purple-500 hover:bg-purple-600 text-white rounded-xl font-semibold transition-colors disabled:opacity-50 flex items-center gap-2"
               >
-                {loading ? (
-                  <Loader2 className="w-5 h-5 animate-spin" />
-                ) : (
-                  <Search className="w-5 h-5" />
-                )}
+                {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Search className="w-5 h-5" />}
                 Buscar
               </button>
             </div>
@@ -451,12 +395,12 @@ useEffect(() => {
         </div>
 
         {/* Error Message */}
-{error && (
-  <div className="bg-red-500/20 border-2 border-red-500 rounded-xl p-4 mb-6 flex items-center gap-3">
-    <AlertCircle className="w-6 h-6 text-red-300" />
-    <p className="text-red-100">{error}</p>
-  </div>
-)}
+        {error && (
+          <div className="bg-red-500/20 border-2 border-red-500 rounded-xl p-4 mb-6 flex items-center gap-3">
+            <AlertCircle className="w-6 h-6 text-red-300" />
+            <p className="text-red-100">{error}</p>
+          </div>
+        )}
 
         {/* Video Player */}
         {videoUrl && (
@@ -470,34 +414,32 @@ useEffect(() => {
                 onPause={handleVideoPause}
                 className="w-full"
               />
-              
-              {/* Subtitles Overlay */}
-{currentSubtitle && (
-  <div className="absolute bottom-16 left-0 right-0 text-center px-4 pointer-events-none">
-    <div className="inline-block bg-black/80 px-6 py-3 rounded-lg backdrop-blur-sm">
-      <p className="text-white text-xl font-semibold drop-shadow-lg">
-        {currentSubtitle}
-      </p>
-    </div>
-  </div>
-)}
+
+              {/* Subtitle Overlay */}
+              {currentSubtitle && (
+                <div className="absolute bottom-16 left-0 right-0 text-center px-4 pointer-events-none">
+                  <div className="inline-block bg-black/80 px-6 py-3 rounded-lg backdrop-blur-sm">
+                    <p className="text-white text-xl font-semibold drop-shadow-lg">
+                      {currentSubtitle}
+                    </p>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Subtitle History */}
             <div className="p-6">
               <div className="flex items-center gap-2 mb-4">
                 <Subtitles className="w-5 h-5 text-purple-300" />
-                <h3 className="text-white font-semibold text-lg">
-                  Historial de Subtítulos
-                </h3>
+                <h3 className="text-white font-semibold text-lg">Historial de Subtítulos</h3>
                 {isTranscribing && (
-  <span className="ml-auto flex items-center gap-2 text-green-400 text-sm">
-    <span className="w-2 h-2 bg-green-400 rounded-full animate-pulse"></span>
-    Transcribiendo...
-  </span>
-)}
+                  <span className="ml-auto flex items-center gap-2 text-green-400 text-sm">
+                    <span className="w-2 h-2 bg-green-400 rounded-full animate-pulse"></span>
+                    En vivo
+                  </span>
+                )}
               </div>
-              
+
               <div className="bg-white/5 rounded-xl p-4 max-h-64 overflow-y-auto">
                 {subtitles.length === 0 ? (
                   <p className="text-purple-300 text-center py-4">
@@ -520,7 +462,7 @@ useEffect(() => {
           </div>
         )}
 
-        {/* Info */}
+        {/* Placeholder */}
         {!videoUrl && !loading && (
           <div className="bg-white/5 backdrop-blur-lg rounded-2xl p-8 text-center">
             <Play className="w-16 h-16 text-purple-300 mx-auto mb-4" />
@@ -528,7 +470,7 @@ useEffect(() => {
               Comienza pegando un Note ID
             </h3>
             <p className="text-purple-200 max-w-md mx-auto">
-              Copia el ID de cualquier nota de Nostr que contenga un video y pégalo arriba. 
+              Copia el ID de cualquier nota de Nostr que contenga un video y pégalo arriba.
               substr generará subtítulos en español automáticamente usando reconocimiento de voz.
             </p>
           </div>
