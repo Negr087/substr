@@ -15,6 +15,7 @@ export async function POST(request: NextRequest) {
   try {
     const formData = await request.formData();
     const audioFile = formData.get('audio') as File;
+    const targetLanguage = (formData.get('targetLanguage') as string) || 'es';
 
     if (!audioFile) {
       return NextResponse.json(
@@ -23,7 +24,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    console.log('🎙️ Transcribiendo audio...', audioFile.size, 'bytes');
+    console.log('🎙️ Transcribiendo audio...', audioFile.size, 'bytes', '→', targetLanguage);
 
     // Crear cliente de Speechmatics
     const client = new BatchClient({
@@ -38,11 +39,11 @@ export async function POST(request: NextRequest) {
       audioFile,
       {
         transcription_config: {
-          language: 'en',
+          language: 'auto',
           operating_point: 'enhanced',
         },
         translation_config: {
-          target_languages: ['es'],
+          target_languages: [targetLanguage],
         },
       },
       'json-v2'
@@ -64,9 +65,9 @@ export async function POST(request: NextRequest) {
     console.log('📋 Keys en respuesta:', Object.keys(jsonResponse));
     console.log('🌍 Traducciones disponibles:', jsonResponse.translations ? Object.keys(jsonResponse.translations) : 'ninguna');
    
-    if (jsonResponse.translations?.es) {
-      console.log('✅ Traducción al español encontrada');
-      const esTranslations = jsonResponse.translations.es;
+    if (jsonResponse.translations?.[targetLanguage]) {
+      console.log(`✅ Traducción a '${targetLanguage}' encontrada`);
+      const esTranslations = jsonResponse.translations[targetLanguage];
       
       // La traducción viene como un array de objetos con content, start_time, end_time
       segments = esTranslations.map((item: any) => ({

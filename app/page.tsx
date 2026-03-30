@@ -27,6 +27,8 @@ const SubstrClient = () => {
   const [subtitles, setSubtitles] = useState<{ time: number; text: string }[]>([]);
   const [currentSubtitle, setCurrentSubtitle] = useState('');
   const [isTranscribing, setIsTranscribing] = useState(false);
+  const [sourceLanguage, setSourceLanguage] = useState('en');
+  const [targetLanguage, setTargetLanguage] = useState('es');
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -49,6 +51,11 @@ const SubstrClient = () => {
     }
     setIsTranscribing(false);
   }, []);
+
+  const targetLanguageRef = useRef(targetLanguage);
+  useEffect(() => { targetLanguageRef.current = targetLanguage; }, [targetLanguage]);
+  const sourceLanguageRef = useRef(sourceLanguage);
+  useEffect(() => { sourceLanguageRef.current = sourceLanguage; }, [sourceLanguage]);
 
   const startTranscription = useCallback(async () => {
     const videoElement = videoRef.current;
@@ -144,12 +151,12 @@ const SubstrClient = () => {
       // 8. Start recognition session
       await client.start(jwt, {
         transcription_config: {
-          language: 'en',
+          language: sourceLanguageRef.current,
           operating_point: 'enhanced',
           enable_partials: true,
         },
         translation_config: {
-          target_languages: ['es'],
+          target_languages: [targetLanguageRef.current],
           enable_partials: true,
         },
         audio_format: {
@@ -362,7 +369,7 @@ const SubstrClient = () => {
             </h1>
           </div>
           <p className="text-purple-200 text-lg">
-            Cliente Nostr con subtítulos automáticos en español
+            Cliente Nostr con subtítulos automáticos traducidos
           </p>
         </div>
 
@@ -372,7 +379,7 @@ const SubstrClient = () => {
             <label className="block text-purple-200 mb-3 font-medium">
               Pega el Note ID del video:
             </label>
-            <div className="flex gap-3">
+            <div className="flex gap-3 mb-3">
               <input
                 type="text"
                 value={noteId}
@@ -390,6 +397,53 @@ const SubstrClient = () => {
                 {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Search className="w-5 h-5" />}
                 Buscar
               </button>
+            </div>
+            <div className="flex items-center gap-4 flex-wrap">
+              <div className="flex items-center gap-2">
+                <label className="text-purple-300 text-sm">Idioma del video:</label>
+                <select
+                  value={sourceLanguage}
+                  onChange={(e) => setSourceLanguage(e.target.value)}
+                  disabled={isTranscribing}
+                  className="px-3 py-2 rounded-lg bg-white/20 text-white border border-purple-400/30 focus:border-purple-400 focus:outline-none text-sm disabled:opacity-50"
+                >
+                  <option value="en">🇺🇸 Inglés</option>
+                  <option value="es">🇪🇸 Español</option>
+                  <option value="de">🇩🇪 Alemán</option>
+                  <option value="fr">🇫🇷 Francés</option>
+                  <option value="it">🇮🇹 Italiano</option>
+                  <option value="pt">🇧🇷 Portugués</option>
+                  <option value="ja">🇯🇵 Japonés</option>
+                  <option value="ko">🇰🇷 Coreano</option>
+                  <option value="zh">🇨🇳 Chino</option>
+                  <option value="ru">🇷🇺 Ruso</option>
+                  <option value="ar">🇸🇦 Árabe</option>
+                  <option value="nl">🇳🇱 Holandés</option>
+                </select>
+              </div>
+              <div className="flex items-center gap-2">
+                <label className="text-purple-300 text-sm">Traducir a:</label>
+                <select
+                  value={targetLanguage}
+                  onChange={(e) => setTargetLanguage(e.target.value)}
+                  disabled={isTranscribing}
+                  className="px-3 py-2 rounded-lg bg-white/20 text-white border border-purple-400/30 focus:border-purple-400 focus:outline-none text-sm disabled:opacity-50"
+                >
+                  <option value="es">🇪🇸 Español</option>
+                  <option value="en">🇺🇸 Inglés</option>
+                  <option value="de">🇩🇪 Alemán</option>
+                  <option value="fr">🇫🇷 Francés</option>
+                  <option value="it">🇮🇹 Italiano</option>
+                  <option value="pt">🇧🇷 Portugués</option>
+                  <option value="ja">🇯🇵 Japonés</option>
+                  <option value="ko">🇰🇷 Coreano</option>
+                  <option value="zh">🇨🇳 Chino</option>
+                  <option value="ru">🇷🇺 Ruso</option>
+                  <option value="ar">🇸🇦 Árabe</option>
+                  <option value="nl">🇳🇱 Holandés</option>
+                  <option value="sv">🇸🇪 Sueco</option>
+                </select>
+              </div>
             </div>
           </div>
         </div>
@@ -471,7 +525,7 @@ const SubstrClient = () => {
             </h3>
             <p className="text-purple-200 max-w-md mx-auto">
               Copia el ID de cualquier nota de Nostr que contenga un video y pégalo arriba.
-              substr generará subtítulos en español automáticamente usando reconocimiento de voz.
+              substr detecta el idioma automáticamente y genera subtítulos en el idioma que elijas.
             </p>
           </div>
         )}
